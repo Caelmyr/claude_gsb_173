@@ -26,14 +26,16 @@ class Metrics:
         self.storage = storage
 
     # -- recording ----------------------------------------------------
-    def record_worker(self, worker) -> None:
+    def record_worker(self, worker, tasks_running: Optional[int] = None) -> None:
         sample = MetricSample(
             ts_ms=now_ms(),
             worker_id=worker.worker_id,
             cpu_percent=worker.cpu_percent,
             mem_percent=worker.mem_percent,
             load1=worker.load1,
-            tasks_running=worker.running_tasks,
+            # The caller passes the count derived from the task table; the
+            # stored record field is only a fallback.
+            tasks_running=worker.running_tasks if tasks_running is None else tasks_running,
             tasks_completed=worker.total_tasks_completed,
         )
         self.storage.append(sample.to_dict(), "metrics", "workers", f"{worker.worker_id}.jsonl")
@@ -84,8 +86,12 @@ class Metrics:
             "load_series": [{"ts": s["ts_ms"], "v": s.get("load1", 0)} for s in samples[-120:]],
         }
 
-    def cluster_metrics(self, workers: list) -> dict:
-        """Cluster-wide aggregate plus per-worker series."""
+    def cluster_metrics(self, workers: list, running_of=None) -> dict:
+        """Cluster-wide aggregate plus per-worker series.
+
+        ``running_of`` resolves a worker's live running-task count (derived
+        from the task table); without it the stored record field is used.
+        """
         per_worker = []
         total_tasks = 0
         for w in workers:
@@ -98,7 +104,7 @@ class Metrics:
                 "cpu_avg": _mean(cpu),
                 "load_avg": _mean(load),
                 "tasks_completed": w.total_tasks_completed,
-                "tasks_running": w.running_tasks,
+                "tasks_running": running_of(w.worker_id) if running_of else w.running_tasks,
                 "samples": len(samples),
             })
             total_tasks += w.total_tasks_completed

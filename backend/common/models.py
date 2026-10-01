@@ -33,7 +33,7 @@ class WorkerRecord:
     cpu_percent: float = 0.0
     mem_percent: float = 0.0
     load1: float = 0.0
-    running_tasks: int = 0
+    running_tasks: int = 0      # legacy cache — the API derives the live count from the task table
     queued_tasks: int = 0
     total_tasks_completed: int = 0
     total_tasks_failed: int = 0

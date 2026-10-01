@@ -148,18 +148,27 @@ class Scheduler:
         out: list[WorkerRecord] = []
         for worker in self.registry.alive():
             capacity = max(1, min(worker.cpu_cores or 2, MAX_TASKS_PER_WORKER))
-            running = self._count_running_on(worker.worker_id)
+            running = self.count_running_tasks(worker.worker_id)
             if running < capacity:
                 out.append(worker)
         return out
 
-    def _count_running_on(self, worker_id: str) -> int:
+    def count_running_tasks(self, worker_id: str) -> int:
+        """Authoritative count of tasks currently on ``worker_id``.
+
+        Derived from the task table — tasks ASSIGNED to or RUNNING on the
+        worker across all active jobs.  This is the same state the monitor
+        page renders, so the nodes page (which reads this through the
+        registry) can never drift from it, go negative, or lag a heartbeat.
+        """
         count = 0
         for job in self.job_manager.list_jobs():
             if job.is_terminal:
                 continue
             for task in self.job_manager.tasks_for(job.job_id):
-                if task.worker_id == worker_id and task.status in C.TASK_ACTIVE_STATES:
+                if task.worker_id == worker_id and task.status in (
+                    C.TASK_ASSIGNED, C.TASK_RUNNING,
+                ):
                     count += 1
         return count
 

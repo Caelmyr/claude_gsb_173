@@ -55,6 +55,9 @@ class Master:
             self.storage, self.job_manager, self.registry, self.shuffle,
             self.fault_tolerance, self.metrics, self.config, self.logbus,
         )
+        # The nodes page / overview / metrics all read the worker's running-task
+        # count from the registry; derive it from the authoritative task table.
+        self.registry.set_running_tasks_provider(self.scheduler.count_running_tasks)
 
         self.app = Flask("master", static_folder=FRONTEND_DIR, static_url_path="")
         self._register_routes()
@@ -315,7 +318,7 @@ class Master:
         return jsonify(self.metrics.worker_metrics(worker_id))
 
     def _cluster_metrics(self):
-        return jsonify(self.metrics.cluster_metrics(self.registry.all()))
+        return jsonify(self.metrics.cluster_metrics(self.registry.all(), self.registry.running_count))
 
     def _config(self):
         if request.method == "PUT":
@@ -355,7 +358,7 @@ class Master:
         worker = self.registry.heartbeat(body)
         if worker is None:
             return jsonify({"ok": False, "error": "unknown worker"}), 404
-        self.metrics.record_worker(worker)
+        self.metrics.record_worker(worker, tasks_running=self.registry.running_count(worker.worker_id))
         return jsonify({"ok": True})
 
     def _worker_task_status(self):

@@ -5,6 +5,10 @@ mirrors it in memory.  A background sweep (driven by the scheduler tick) marks
 any worker whose heartbeat is older than ``heartbeat_timeout_sec`` as dead and
 invokes the fault-tolerance callback so its in-flight tasks are reassigned —
 this is the "distributed coordination and fault tolerance" backbone.
+
+The per-worker *running tasks* number shown in the UI is **not** a stored
+counter: it is derived from the Master's task table through
+``set_running_tasks_provider`` so it can never drift, go stale or negative.
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ class WorkerRegistry:
         self.on_death = on_death
         self._workers: dict[str, WorkerRecord] = {}
         self._lock = threading.RLock()
+        # Derives the live running-task count per worker from the task table.
+        self._running_tasks_provider: Optional[Callable[[str], int]] = None
         self._load()
 
     # ------------------------------------------------------------------
@@ -84,22 +90,54 @@ class WorkerRegistry:
             worker.cpu_percent = float(payload.get("cpu_percent", worker.cpu_percent))
             worker.mem_percent = float(payload.get("mem_percent", worker.mem_percent))
             worker.load1 = float(payload.get("cpu_percent", worker.load1))
-            worker.running_tasks = int(payload.get("running_tasks", worker.running_tasks))
+            # NOTE: the payload's ``running_tasks`` is deliberately ignored —
+            # the authoritative count is derived from the Master's task table
+            # (see ``running_count``); trusting a sampled, in-flight value here
+            # is what made the nodes page drift from reality.
             worker.queued_tasks = int(payload.get("queued_tasks", worker.queued_tasks))
             self._save(worker)
             return worker
 
     def task_finished(self, worker_id: str, success: bool) -> None:
+        """Bookkeep a completed attempt (cumulative counters only).
+
+        ``running_tasks`` is intentionally *not* decremented here: it is a
+        derived value, and pairing increments/decrements across asynchronous
+        heartbeat and completion paths is what produced negative/stale counts.
+        """
         with self._lock:
             worker = self._workers.get(worker_id)
             if worker is None:
                 return
-            worker.running_tasks = max(0, worker.running_tasks - 1)
             if success:
                 worker.total_tasks_completed += 1
             else:
                 worker.total_tasks_failed += 1
             self._save(worker)
+
+    # ------------------------------------------------------------------
+    # Derived running-task count
+    # ------------------------------------------------------------------
+    def set_running_tasks_provider(self, provider: Callable[[str], int]) -> None:
+        """Wire the function that counts a worker's live tasks from the task table."""
+        self._running_tasks_provider = provider
+
+    def running_count(self, worker_id: str) -> int:
+        """Live number of tasks assigned to / running on ``worker_id``.
+
+        Derived from the authoritative task table when a provider is wired
+        (always, in the Master), so it agrees with the monitor page at every
+        instant and can never go negative.  Falls back to the stored field
+        when no provider is set (e.g. a standalone registry in tests).
+        """
+        provider = self._running_tasks_provider
+        if provider is not None:
+            try:
+                return max(0, int(provider(worker_id)))
+            except Exception:  # noqa: BLE001 - never break the nodes page
+                pass
+        worker = self.get(worker_id)
+        return worker.running_tasks if worker else 0
 
     # ------------------------------------------------------------------
     def get(self, worker_id: str) -> Optional[WorkerRecord]:
@@ -136,9 +174,14 @@ class WorkerRegistry:
     def summary(self) -> dict:
         workers = self.all()
         alive = [w for w in workers if w.is_alive]
+        views: list[dict] = []
+        for w in sorted(workers, key=lambda w: w.worker_id):
+            view = w.to_dict()
+            view["running_tasks"] = self.running_count(w.worker_id)
+            views.append(view)
         return {
             "total": len(workers),
             "alive": len(alive),
             "dead": len(workers) - len(alive),
-            "workers": [w.to_dict() for w in sorted(workers, key=lambda w: w.worker_id)],
+            "workers": views,
         }
