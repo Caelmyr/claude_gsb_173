@@ -194,11 +194,20 @@ class Executor:
         self.exec_mode = exec_mode
         self.client = HttpClient(timeout=8.0, retries=2)
         self._handles: dict[str, dict] = {}
+        # ``_seq`` is a monotonically increasing generation counter for the set of
+        # running task ids.  It increments on every add/remove so the Master can
+        # reject out-of-order snapshots and always keep the freshest view.
+        self._seq = 0
         self._lock = threading.Lock()
         self._tmp_dir = os.path.join(data_root, "tmp")
         os.makedirs(self._tmp_dir, exist_ok=True)
 
     # -- bookkeeping --------------------------------------------------
+    def snapshot(self) -> tuple[int, list[str]]:
+        """Return ``(seq, running_task_ids)`` — the executor's ground truth."""
+        with self._lock:
+            return self._seq, list(self._handles.keys())
+
     @property
     def running_count(self) -> int:
         with self._lock:
@@ -224,7 +233,9 @@ class Executor:
                 "started_ms": now_ms(),
                 "cancel": threading.Event(),
                 "last_status_ms": 0,
+                "finished": False,
             }
+            self._seq += 1
         runner = self._run_process if self.exec_mode == "process" else self._run_thread
         threading.Thread(target=runner, args=(task_id,), daemon=True, name=f"task-{task_id}").start()
         return True
@@ -243,7 +254,10 @@ class Executor:
 
     # -- thread backend ----------------------------------------------
     def _run_thread(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+        with self._lock:
+            handle = self._handles.get(task_id)
+        if handle is None:
+            return
         spec = handle["spec"]
 
         def progress_cb(progress: float, processed: int, emitted: int) -> None:
@@ -252,18 +266,16 @@ class Executor:
         try:
             result = _execute_task(spec, self.data_root, progress_cb)
             result["status"] = C.TASK_SUCCEEDED
-            self._complete(task_id, result)
         except Exception as exc:  # noqa: BLE001
-            self._complete(task_id, {
-                "status": C.TASK_FAILED,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-        finally:
-            self._remove(task_id)
+            result = {"status": C.TASK_FAILED, "error": f"{type(exc).__name__}: {exc}"}
+        self._finish(task_id, result)
 
     # -- process backend ---------------------------------------------
     def _run_process(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+        with self._lock:
+            handle = self._handles.get(task_id)
+        if handle is None:
+            return
         spec = handle["spec"]
         work_dir = os.path.join(self._tmp_dir, f"task-{task_id}-{now_ms()}")
         os.makedirs(work_dir, exist_ok=True)
@@ -285,8 +297,7 @@ class Executor:
             if handle["cancel"].is_set():
                 proc.terminate()
                 proc.join(timeout=2.0)
-                self._complete(task_id, {"status": C.TASK_FAILED, "error": "cancelled"})
-                self._remove(task_id)
+                self._finish(task_id, {"status": C.TASK_FAILED, "error": "cancelled"})
                 return
             time.sleep(0.25)
             prog = read_json(progress_path)
@@ -296,8 +307,43 @@ class Executor:
         proc.join()
 
         result = read_json(result_path, default={"status": C.TASK_FAILED, "error": "no result file"})
-        self._complete(task_id, result)
-        self._remove(task_id)
+        self._finish(task_id, result)
+
+    def _finish(self, task_id: str, result: dict) -> None:
+        """Atomically finalize a task: post completion with the post-removal snapshot.
+
+        The handle removal, the sequence bump and the snapshot all happen under
+        one lock, so the completion report and the very next heartbeat can never
+        disagree about whether this task is still running.
+        """
+        with self._lock:
+            handle = self._handles.get(task_id)
+            if handle is None or handle.get("finished"):
+                return  # already finalized (e.g. cancel raced with natural exit)
+            handle["finished"] = True
+            spec = handle["spec"]
+            started_ms = handle["started_ms"]
+            self._handles.pop(task_id, None)
+            self._seq += 1
+            seq, running_ids = self._seq, list(self._handles.keys())
+
+        self._post("/api/workers/task-complete", {
+            "worker_id": self.worker_id,
+            "job_id": spec.get("job_id", ""),
+            "task_id": task_id,
+            "kind": spec.get("kind", ""),
+            "attempt": int(spec.get("attempt", 0) or 0),
+            "speculative": bool(spec.get("speculative", False)),
+            "status": result.get("status", C.TASK_FAILED),
+            "records_processed": result.get("records_processed", 0),
+            "records_emitted": result.get("records_emitted", 0),
+            "duration_ms": int((now_ms() - started_ms) / 1000),
+            "partition_sizes": result.get("partition_sizes", {}),
+            "results": result.get("results", []),
+            "error": result.get("error", ""),
+            "state_seq": seq,
+            "running_task_ids": running_ids,
+        })
 
     # -- reporting to master -----------------------------------------
     def _post(self, path: str, payload: dict) -> None:
@@ -314,6 +360,7 @@ class Executor:
         if now - handle.get("last_status_ms", 0) < 300:
             return
         handle["last_status_ms"] = now
+        seq, running_ids = self.snapshot()
         self._post("/api/workers/task-status", {
             "worker_id": self.worker_id,
             "job_id": spec["job_id"],
@@ -322,25 +369,6 @@ class Executor:
             "progress": round(min(1.0, max(0.0, progress)), 4),
             "records_processed": processed,
             "records_emitted": emitted,
+            "state_seq": seq,
+            "running_task_ids": running_ids,
         })
-
-    def _complete(self, task_id: str, result: dict) -> None:
-        handle = self._handles.get(task_id)
-        spec = handle["spec"] if handle else {}
-        self._post("/api/workers/task-complete", {
-            "worker_id": self.worker_id,
-            "job_id": spec.get("job_id", ""),
-            "task_id": task_id,
-            "kind": spec.get("kind", ""),
-            "status": result.get("status", C.TASK_FAILED),
-            "records_processed": result.get("records_processed", 0),
-            "records_emitted": result.get("records_emitted", 0),
-            "duration_ms": int((now_ms() - handle["started_ms"]) / 1000) if handle else 0,
-            "partition_sizes": result.get("partition_sizes", {}),
-            "results": result.get("results", []),
-            "error": result.get("error", ""),
-        })
-
-    def _remove(self, task_id: str) -> None:
-        with self._lock:
-            self._handles.pop(task_id, None)

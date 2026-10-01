@@ -33,7 +33,14 @@ class WorkerRecord:
     cpu_percent: float = 0.0
     mem_percent: float = 0.0
     load1: float = 0.0
+    # Authoritative view reported by the worker: the exact set of task ids the
+    # worker's executor is running, with a monotonic ``state_seq`` used to
+    # reject out-of-order snapshots. ``running_tasks`` is always this set's
+    # length (plus master-side dispatched-but-not-yet-observed tasks), so it
+    # can never drift or go negative.
     running_tasks: int = 0
+    running_task_ids: list[str] = field(default_factory=list)
+    state_seq: int = 0
     queued_tasks: int = 0
     total_tasks_completed: int = 0
     total_tasks_failed: int = 0

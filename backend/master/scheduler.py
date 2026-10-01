@@ -81,6 +81,8 @@ class Scheduler:
         # 1. Reap dead workers and reassign their tasks (on a coarser cadence).
         self._tick_count = getattr(self, "_tick_count", 0) + 1
         if self._tick_count % 5 == 0:
+            # Drop optimistic dispatch entries the worker never confirmed.
+            self.registry.prune_launching()
             for worker in self.registry.reap():
                 count = self.fault_tolerance.handle_worker_death(worker)
                 if count:
@@ -148,20 +150,13 @@ class Scheduler:
         out: list[WorkerRecord] = []
         for worker in self.registry.alive():
             capacity = max(1, min(worker.cpu_cores or 2, MAX_TASKS_PER_WORKER))
-            running = self._count_running_on(worker.worker_id)
+            # Use the registry's ground-truth running count (worker snapshots +
+            # optimistic dispatched entries) rather than re-deriving it from
+            # task states, which lags and disagrees with the nodes page.
+            running = worker.running_tasks
             if running < capacity:
                 out.append(worker)
         return out
-
-    def _count_running_on(self, worker_id: str) -> int:
-        count = 0
-        for job in self.job_manager.list_jobs():
-            if job.is_terminal:
-                continue
-            for task in self.job_manager.tasks_for(job.job_id):
-                if task.worker_id == worker_id and task.status in C.TASK_ACTIVE_STATES:
-                    count += 1
-        return count
 
     def _least_loaded(self, workers: list[WorkerRecord],
                       exclude: Optional[str] = None) -> Optional[WorkerRecord]:
@@ -202,6 +197,9 @@ class Scheduler:
                 t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        # Count the task on that worker immediately; the worker's first
+        # heartbeat/status snapshot confirms it and drops the optimistic entry.
+        self.registry.note_dispatched(worker.worker_id, task.task_id)
         self.logbus.info(
             job.job_id,
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
@@ -217,7 +215,7 @@ class Scheduler:
             "mapper": job.mapper,
             "reducer": job.reducer,
             "params": job.params,
-            "attempt": 0,
+            "attempt": task.attempts,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
         }
         if task.kind == C.TASK_MAP:
@@ -233,6 +231,11 @@ class Scheduler:
     # Completion / progress handling (invoked from Flask routes)
     # ------------------------------------------------------------------
     def on_task_status(self, payload: dict) -> None:
+        # Adopt the worker's authoritative running set first (the snapshot is
+        # valid regardless of the task lifecycle handling below).
+        worker_id = payload.get("worker_id", "")
+        self.registry.apply_task_report(payload)
+
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
@@ -251,20 +254,50 @@ class Scheduler:
             t.records_emitted = int(payload.get("records_emitted", t.records_emitted))
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
+        if worker_id:
+            self.registry.note_observed(worker_id, task.task_id)
 
     def on_task_complete(self, payload: dict) -> None:
+        # Always adopt the worker's post-completion running set first.  This is
+        # idempotent (a full snapshot, not a delta), so duplicate / retried /
+        # out-of-order deliveries cannot corrupt the count even when the
+        # lifecycle handling below early-returns.
+        self.registry.apply_task_report(payload)
+
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
         if task is None or task.status == C.TASK_SUCCEEDED:
-            return  # duplicate completion from a speculative loser
+            return  # duplicate completion from a speculative loser / HTTP retry
 
         worker_id = payload.get("worker_id", "")
         status = payload.get("status", C.TASK_FAILED)
 
+        # Stale-attempt guard: once a failure has been retried (or a speculative
+        # copy superseded), a late report for an older attempt must not touch the
+        # live task.  The report's snapshot was already adopted above, which is
+        # all the accounting needs.
+        attempt = payload.get("attempt")
+        if attempt is not None:
+            try:
+                if int(attempt) < task.attempts:
+                    return
+            except (TypeError, ValueError):
+                pass
+
         if status != C.TASK_SUCCEEDED:
-            self.registry.task_finished(worker_id, success=False)
+            # A failing speculative backup is not the primary copy: the primary
+            # (or another backup) is still running, so just tally the failed
+            # attempt without triggering a retry of the whole task.
+            if payload.get("speculative") and task.status in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                self.registry.record_task_outcome(worker_id, success=False)
+                return
+            # Idempotency: a retried POST for the same failed attempt finds the
+            # task already RETRYING/FAILED; do not record/handle it twice.
+            if task.status not in C.TASK_ACTIVE_STATES:
+                return
+            self.registry.record_task_outcome(worker_id, success=False)
             self.fault_tolerance.handle_task_failure(job, task, payload.get("error", ""), worker_id)
             return
 
@@ -284,7 +317,7 @@ class Scheduler:
             t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
-        self.registry.task_finished(worker_id, success=True)
+        self.registry.record_task_outcome(worker_id, success=True)
         self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
 
         if task.kind == C.TASK_REDUCE:

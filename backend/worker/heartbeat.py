@@ -27,7 +27,9 @@ class HeartbeatThread(threading.Thread):
         super().__init__(daemon=True, name=f"heartbeat-{worker_id}")
         self.worker_id = worker_id
         self.master_url = master_url.rstrip("/")
-        self.interval = max(0.2, interval_sec / 4.0)
+        # ``interval_sec`` is the actual heartbeat cadence; clamp it so an
+        # unusably small config value cannot flood the Master.
+        self.interval = max(0.2, interval_sec)
         self.status_provider = status_provider
         self.client = client or HttpClient(timeout=5.0, retries=1)
         # NOTE: named ``_stop_event`` (not ``_stop``) because ``threading._after_fork``
